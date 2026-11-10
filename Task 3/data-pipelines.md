@@ -1,0 +1,112 @@
+### Пайплайны данных в архитектуре FinUnion Group
+
+
+Документ содержит описание пайплайнов для кейса FinUnion + RetailBank и сценарий обработки больших исторических данных.
+
+
+
+###### Пайплайн 1: Загрузка данных в Fed DWH (PostgreSQL) — промежуточное состояние (3 месяца)
+
+|Аспект|Описание|
+|:-:|:-:|
+|Название|fed\_dwh\_client\_account\_daily|
+|Тип|Batch (ежедневно, в 02:00)|
+|Источник 1|FU DWH (PostgreSQL)|
+|Источник 2|RB DWH (PostgreSQL)|
+|Приёмник|Fed DWH (PostgreSQL)|
+|Передаваемые сущности|Клиент (Customer), Счёт (Account), Договор (Agreement), Транзакция (Transaction)|
+|Объём данных|\~10 млн строк за загрузку (клиенты + счета + транзакции за день)|
+|Инструменты|Airflow (оркестрация), SQL (INSERT INTO … SELECT) (перенос), Python-скрипты (маппинг, трансформация), PostgreSQL FDW (Foreign Data Wrapper) для прямого чтения|
+|Описание шагов|1. Airflow запускает DAG в 02:00. <br />2. Python-скрипт подключается к FU DWH и RB DWH через FDW. <br />3. Выполняется SQL-запрос: маппинг справочников (продукты, типы счетов, статусы) по заранее настроенным таблицам соответствий. <br />4. Валидация: проверка дублей клиентов по ИНН/паспорту (простые правила: если ИНН совпадает — это один клиент). <br />5. Загрузка в Fed DWH: вставка в таблицы fact\_transaction, dim\_client, dim\_account, dim\_agreement. 6. Проверка качества: количество записей, контрольные суммы, доля дублей (< 1%). <br />7. Airflow отправляет уведомление (успех/ошибка).|
+|SLA|Загрузка завершена к 04:00. Ошибки — менее 0.1%.|
+
+###### Пайплайн 2: Streaming-пайплайн CDC → Kafka → Data Lakehouse (12 месяцев)
+
+|Аспект|Описание|
+|:-:|:-:|
+|Название|cdc\_core\_to\_lakehouse\_streaming|
+|Тип|Streaming (непрерывный)|
+|Источник|Единая АБС (FU Core, PostgreSQL)|
+|Приёмник|Data Lakehouse (Apache Iceberg на S3)|
+|Передаваемые сущности|Все изменения: Счёт (Account), Договор (Agreement), Транзакция (Transaction), Платёж (Payment)|
+|Объём данных|\~10 000 событий в секунду (в пике)|
+|Инструменты|Debezium (CDC), Kafka Connect (коннектор), Apache Kafka (событийная шина), Apache Spark Structured Streaming (обработка), Apache Iceberg (формат хранения)|
+|Описание шагов|1. Debezium отслеживает WAL (Write-Ahead Log) PostgreSQL. <br />2. Каждое изменение (INSERT/UPDATE/DELETE) публикуется в топик Kafka cdc.core.account (или cdc.core.transaction). <br />3. Spark Structured Streaming подписан на топики Kafka. <br />4. Spark преобразует события Avro в Parquet с добавлением: event\_timestamp, source\_system, operation\_type. <br />5. Запись в Iceberg-таблицы: iceberg.transactions, iceberg.accounts, iceberg.agreements. 6. Партиционирование: по дате + типу операции.<br /> 7. Кэмпакция (compaction) Iceberg — каждые 6 часов. <br />8. Валидация: количество записей, задержка (latency < 5 минут).|
+|SLA|Задержка от CDC до Lakehouse — менее 5 минут. Пропускная способность — 100 000 событий в секунду.|
+
+###### Пайплайн 3: ELT-пайплайн Lakehouse → DWH (витрина отчётности для ЦБ) (12 месяцев)
+
+|Аспект|Описание|
+|:-:|:-:|
+|Название|lakehouse\_to\_dwh\_form\_cb\_daily|
+|Тип|Batch (ежедневно, в 03:00)|
+|Источник|Data Lakehouse (Apache Iceberg, партиционированные таблицы)|
+|Приёмник|DWH (ClickHouse)|
+|Передаваемые сущности|Агрегированные витрины для формы ЦБ 0409101 (Баланс) и 0409155 (Прибыли/Убытки)|
+|Объём данных|\~50 млн строк (агрегированные данные за день)|
+|Инструменты|Apache Airflow (оркестрация), Apache Spark SQL (трансформация), ClickHouse JDBC (загрузка), Iceberg (источник)|
+|Описание шагов|1. Airflow запускает DAG в 03:00. 2. Spark читает данные из Iceberg за последние 24 часа: iceberg.transactions, iceberg.accounts, iceberg.agreements. <br />3. Spark выполняет агрегацию: SUM(остаток) по типам счетов, COUNT(транзакций), SUM(комиссий). <br />4. Обогащение данными из MDM (golden\_id, сегмент клиента). <br />5. Запись витрины в ClickHouse: таблица cb\_form\_0409101\_daily. <br />6. Валидация: контрольная сумма (сходимость с итогами Core), проверка на пустые значения. 7. Airflow отправляет отчёт о качестве данных.|
+|SLA|Загрузка завершена к 05:00. Ошибки — 0% (регуляторная отчётность).|
+
+### Сценарий обработки больших исторических данных для архивных выгрузок
+
+Этап 1: Извлечение данных из источников (Ingestion)
+
+
+
+|Шаг|Действие|Источник|Приёмник|Инструменты|Длительность|
+|:-:|:-:|:-:|:-:|:-:|:-:|
+|1.1|Историческая выгрузка — однократное извлечение всех данных FU и RetailBank за 3-7 лет|FU Core, RB Core, FU Cards, RB Cards, FU Loans, RB Loans, FU DWH, RB DWH|Batch Extractor (через pg\_dump, COPY, экспорт в CSV/Parquet)|Airflow (оркестрация), pg\_dump (PostgreSQL), Spark (Parquet-конвертация)|2-4 недели (параллельно по 8 потоков)|
+|1.2|CDC (текущие изменения) — непрерывный захват изменений из операционных БД|FU Core (PostgreSQL WAL), RB Core (PostgreSQL WAL, до отключения)|Debezium → Kafka|Debezium (CDC), Kafka Connect (коннектор), Kafka (топики)|Непрерывно (после настройки)|
+
+Этап 2: Первичная обработка (Processing)
+
+|Шаг|Действие|Источник|Приёмник|Инструменты|Описание|
+|:-:|:-:|:-:|:-:|:-:|:-:|
+|2.1|Загрузка в Staging — исторические Parquet-файлы загружаются во временное хранилище|Batch Extractor (Parquet)|Staging Area (S3 + Spark)|Airflow, Spark, S3|Партиционирование по дате и источнику (FU/RB)|
+|2.2|Потоковая загрузка из Kafka — текущие изменения поступают в Lakehouse через Spark Streaming|Kafka (Avro)|Data Lakehouse (Iceberg)|Spark Structured Streaming, Iceberg|Exactly-once семантика, задержка < 5 минут|
+
+Этап 3: Очистка, маппинг и дедубликация (Cleansing)
+
+|Шаг|Действие|Инструменты|Описание|
+|:-:|:-:|:-:|:-:|
+|3.1|Маппинг справочников — приведение типов счетов, продуктов, статусов к единому формату (FU vs RB)|Spark SQL, MDM-справочники|map\_fu\_type(), map\_rb\_type() — функции маппинга|
+|3.2|Дедубликация клиентов — объединение клиентов FU и RB по golden\_id из MDM|Spark SQL, MDM|FULL OUTER JOIN по RRN + дате (транзакции), по ИНН/паспорту (клиенты)|
+|3.3|Дедубликация транзакций — удаление дублей (если транзакция есть и в FU, и в RB)|Spark SQL|DISTINCT ON (rrn, operation\_date)|
+|3.4|Обогащение MDM ID — простановка golden\_id для всех записей|Spark SQL, MDM API|LEFT JOIN mdm.golden\_client|
+
+Этап 4: Загрузка в Data Lakehouse (Curated Layer)
+
+|Шаг|Действие|Источник|Приёмник|Инструменты|Партиционирование|
+|:-:|:-:|:-:|:-:|:-:|:-:|
+|4.1|Загрузка исторических данных — очищенные данные из Staging|Staging (S3 + Spark)|Lakehouse (Iceberg-таблицы)|Spark, Iceberg|year/month/day + source\_system|
+|4.2|Слияние с текущими данными — объединение исторической загрузки и streaming-данных из Kafka|Staging + Kafka|Lakehouse (Iceberg)|Spark Structured Streaming + Batch|year/month/day + operation\_type|
+
+Этап 5: Агрегация в DWH (Transformation)
+
+|Шаг|Действие|Источник|Приёмник|Инструменты|Описание|
+|:-:|:-:|:-:|:-:|:-:|:-:|
+|5.1|Ежедневная ELT-обработка — агрегация данных из Lakehouse в витрины DWH|Lakehouse (Spark SQL)|DWH (ClickHouse)|Airflow (DAG), Spark (чтение), ClickHouse JDBC (запись)|Агрегация: SUM(остатки), COUNT(транзакции), AVG(ставки)|
+|5.2|Формирование витрин для ЦБ — витрины для форм 0409101, 0409155|Lakehouse → DWH|DWH (ClickHouse)|Spark SQL, ClickHouse|Группировка по типам счетов, клиентов, продуктов|
+
+Этап 6: Архивация данных старше 7 лет (Archival)
+
+|Шаг|Действие|Источник|Приёмник|Инструменты|Описание|
+|:-:|:-:|:-:|:-:|:-:|:-:|
+|6.1|Идентификация данных для архивации — выборка данных старше 7 лет|Lakehouse (Spark SQL)|—|Spark SQL|WHERE year < YEAR(CURRENT\_DATE) - 7|
+|6.2|Экспорт в Parquet (сжатый) — подготовка файлов для архива|Lakehouse (Spark)|S3 (временная папка)|Spark, Parquet (ZSTD сжатие)|Размер файла \~128 MB|
+|6.3|Перемещение в S3 Glacier — настройка Lifecycle Policy|S3 (временная папка)|S3 Glacier Deep Archive|S3 Lifecycle Policy (через 1 день → Glacier)|aws s3api put-bucket-lifecycle-configuration|
+|6.4|Удаление Iceberg snapshot — очистка Lakehouse от архивных данных|Lakehouse (Spark)|—|Iceberg EXPIRED SNAPSHOT|CALL iceberg.system.expire\_snapshots('transactions', TIMESTAMP '...')|
+
+Этап 7: Использование данных потребителями (Consumption)
+
+|Шаг|Потребитель|Источник|Тип доступа|SLA|Описание|
+|:-:|:-:|:-:|:-:|:-:|:-:|
+|7.1|Аналитики (BI)|DWH (витрины) + Lakehouse (сырые данные)|SQL-запросы (ClickHouse + Trino)|< 10 сек (DWH), < 30 сек (Lakehouse)|Дашборды по доходам, клиентам, продуктам. Ad-hoc аналитика по историческим данным|
+|7.2|Регулятор (ЦБ РФ)|DWH (витрины)|Batch (формы ЦБ, МСФО)|< 1 час|Формы (Баланс),  (Прибыли/Убытки), МСФО|
+|7.3|Риск-менеджмент|DWH (витрины)|Batch (ежедневно)|< 15 мин|Кредитный риск, просрочки, резервы по МСФО 9|
+|7.4|Антифрод|Lakehouse (сырые транзакции)|Streaming + Batch|< 5 мин (streaming)|ML-модели для обнаружения фрода в реальном времени|
+|7.5|Data Science|Lakehouse (сырые данные)|Batch (по запросу)|< 1 час|ML-модели: скоринг, LTV, сегментация, churn prediction|
+
+
+
